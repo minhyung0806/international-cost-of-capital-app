@@ -1,6 +1,7 @@
 """International cost of capital | Streamlit Community Cloud."""
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import numpy as np
@@ -26,7 +27,7 @@ def normalize_country(s):
     return ALIASES.get(s, s)
 
 def fetch(url):
-    r = requests.get(url.split('#')[0], headers=HEADERS, timeout=22)
+    r = requests.get(url.split('#')[0], headers=HEADERS, timeout=(3, 6))
     r.raise_for_status()
     return r.content
 
@@ -166,18 +167,40 @@ if st.button('↻ Refresh source data', help='Clear cached web data and fetch so
     st.cache_data.clear()
     st.rerun()
 
-errors = {}
-def load(label, func, default):
-    try: return func()
-    except Exception as exc:
-        errors[label] = str(exc)
-        return default
+# Load independent sources concurrently. A blocked source must not hold the
+# entire interface hostage while other sources are waiting for HTTP timeouts.
+# Streamlit caches successful calls for 30–60 minutes; refresh clears caches.
+SOURCES = {
+    'Damodaran industry betas': (get_betas, ({}, 'Unavailable')),
+    'Damodaran BBB spread': (get_bbb_spread, (None, 'Unavailable')),
+    'OECD statutory tax rates': (get_oecd_taxes, ({}, 'Unavailable')),
+    'Trading Economics 10-year yields': (get_bond_yields, {}),
+    'FRED U.S. 10-year fallback': (get_fred_us_yield, (None, 'Unavailable')),
+}
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_sources():
+    """Cache failures too, preventing repeated blocked requests on widget changes."""
+    errors = {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(SOURCES)) as pool:
+        tasks = {pool.submit(func): label for label, (func, _) in SOURCES.items()}
+        for future in as_completed(tasks):
+            label = tasks[future]
+            try:
+                results[label] = future.result()
+            except Exception as exc:
+                errors[label] = f'{type(exc).__name__}: {exc}'
+                results[label] = SOURCES[label][1]
+    return results, errors
 
-betas, beta_note = load('Damodaran industry betas',get_betas,({},'Unavailable'))
-spread_data = load('Damodaran BBB spread',get_bbb_spread,(None,'Unavailable'))
-taxes, tax_year = load('OECD statutory tax rates',get_oecd_taxes,({},'Unavailable'))
-yields = load('Trading Economics 10-year yields',get_bond_yields,{})
-fred_yield, fred_date = load('FRED U.S. 10-year fallback',get_fred_us_yield,(None,'Unavailable'))
+with st.spinner('Loading market data (unavailable providers will be skipped)…'):
+    results, errors = load_sources()
+
+betas, beta_note = results['Damodaran industry betas']
+spread_data = results['Damodaran BBB spread']
+taxes, tax_year = results['OECD statutory tax rates']
+yields = results['Trading Economics 10-year yields']
+fred_yield, fred_date = results['FRED U.S. 10-year fallback']
 if 'United States' not in yields and fred_yield is not None:
     yields['United States'] = fred_yield
 
@@ -209,7 +232,7 @@ with st.sidebar:
     us_auto = yields.get('United States')
     us_val,us_on = override('U.S. 10-year yield (%)',us_auto*100 if us_auto is not None else None,PLACEHOLDER_YIELD_PCT)
     foreign_auto = yields.get(country)
-    foreign_val,foreign_on = override('Selected-country 10-year yield (%)',foreign_auto*100 if foreign_auto is not None else None,PLACEHOLDER_YIELD_PCT)
+    foreign_val,foreign_on = override('Selected-country 10-year yield (%)',foreign_auto*100 if foreign_auto is not None else None,us_val if country == 'United States' else PLACEHOLDER_YIELD_PCT)
     foreign_override_on = st.checkbox('Override foreign-currency BBB spread',value=False)
     foreign_spread_val = st.number_input('Foreign BBB spread (%)',value=1.5,step=0.1,format='%.3f',disabled=not foreign_override_on)
 
@@ -218,10 +241,9 @@ tax = tax_val/100 if tax_on else tax_auto
 spread = spread_val/100 if spread_on else spread_auto
 us_yield = us_val/100 if us_on else us_auto
 foreign_yield = foreign_val/100 if foreign_on else foreign_auto
-if country=='United States' and not foreign_on:
-    foreign_yield = us_yield  # identical country should use identical yield unless explicitly overridden
-elif country=='United States' and foreign_auto is None and foreign_on:
-    # When US is the target, the same USD 10Y yield must be used by default.
+if country == 'United States':
+    # Selecting the same currency must always give the same government yield.
+    # A foreign-spread override is still allowed as an explicit credit adjustment.
     foreign_yield = us_yield
 foreign_spread_override = foreign_spread_val/100 if foreign_override_on else None
 
