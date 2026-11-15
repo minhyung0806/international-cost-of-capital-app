@@ -1,8 +1,13 @@
 """International cost of capital | Streamlit Community Cloud."""
 import io
+import json
+import os
+import time
+from pathlib import Path
+from xml.etree import ElementTree as ET
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
@@ -11,9 +16,10 @@ import streamlit as st
 
 BETAS_URL = 'https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls'
 RATINGS_URL = 'https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html'
-OECD_URL = 'https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html#chapter-d1e2342-08e74a33fb'
-BONDS_URL = 'https://tradingeconomics.com/bonds'
-FRED_US_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10'
+OECD_TAX_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13+S1311+S13M...?startPeriod=2023&format=csvfile'
+OECD_YIELDS_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/.M.IRLT.PA.....?startPeriod=2025-01&format=csvfile'
+TREASURY_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve&page&_format=csv'
+TREASURY_XML_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={yyyymm}'
 # Editable placeholders are NOT market observations. They are used only if fetching fails.
 PLACEHOLDER_TAX_PCT = 25.0
 PLACEHOLDER_YIELD_PCT = 4.0
@@ -22,12 +28,75 @@ DEFAULT_INDUSTRY = 'Software (System & Application)'
 COUNTRIES = ['United States','Australia','Austria','Belgium','Brazil','Canada','Chile','China','Colombia','Czech Republic','Denmark','Finland','France','Germany','Greece','Hungary','India','Indonesia','Ireland','Israel','Italy','Japan','Malaysia','Mexico','Netherlands','New Zealand','Norway','Philippines','Poland','Portugal','Romania','Saudi Arabia','Singapore','South Africa','South Korea','Spain','Sweden','Switzerland','Thailand','Turkey','United Kingdom','Vietnam']
 ALIASES = {'US':'United States','USA':'United States','United States of America':'United States','UK':'United Kingdom','Britain':'United Kingdom','Korea':'South Korea','Korea, Rep.':'South Korea','Korea (Republic of)':'South Korea','Republic of Korea':'South Korea','Türkiye':'Turkey','Turkiye':'Turkey','Czechia':'Czech Republic','Russian Federation':'Russia','Slovak Republic':'Slovakia','The Netherlands':'Netherlands'}
 
+ISO_COUNTRY = {
+ 'AUS':'Australia','AUT':'Austria','BEL':'Belgium','BRA':'Brazil','CAN':'Canada',
+ 'CHL':'Chile','CHN':'China','COL':'Colombia','CZE':'Czech Republic',
+ 'DNK':'Denmark','FIN':'Finland','FRA':'France','DEU':'Germany','GRC':'Greece',
+ 'HUN':'Hungary','IND':'India','IDN':'Indonesia','IRL':'Ireland','ISR':'Israel',
+ 'ITA':'Italy','JPN':'Japan','MYS':'Malaysia','MEX':'Mexico','NLD':'Netherlands',
+ 'NZL':'New Zealand','NOR':'Norway','PHL':'Philippines','POL':'Poland',
+ 'PRT':'Portugal','ROU':'Romania','SAU':'Saudi Arabia','SGP':'Singapore',
+ 'ZAF':'South Africa','KOR':'South Korea','ESP':'Spain','SWE':'Sweden',
+ 'CHE':'Switzerland','THA':'Thailand','TUR':'Turkey','GBR':'United Kingdom',
+ 'USA':'United States','VNM':'Vietnam',
+}
+SOURCE_TTL = 3600
+SNAPSHOT_FILE = Path(os.getenv('COC_SNAPSHOT_PATH', '/tmp/international_coc_verified_snapshot_v4.json'))
+
+def _snapshot_read():
+    try:
+        raw=json.loads(SNAPSHOT_FILE.read_text())
+        return raw if isinstance(raw,dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _snapshot_save(kind, value):
+    try:
+        data=_snapshot_read()
+        data[kind]=value
+        SNAPSHOT_FILE.parent.mkdir(parents=True,exist_ok=True)
+        temp=SNAPSHOT_FILE.with_suffix('.tmp')
+        temp.write_text(json.dumps(data))
+        temp.replace(SNAPSHOT_FILE)
+    except (OSError, TypeError, ValueError):
+        pass  # App remains usable if disk is read-only.
+
+def resilient(kind, call, empty):
+    try:
+        value=call()
+        _snapshot_save(kind,value)
+        return value, 'Live fetch', None
+    except Exception as exc:
+        cached=_snapshot_read().get(kind)
+        if cached is not None:
+            return cached, 'Previously verified local cache', str(exc)
+        return empty, 'Unavailable', str(exc)
+
+def fetch_csv(url):
+    data=fetch(url)
+    df=pd.read_csv(io.BytesIO(data),low_memory=False)
+    if df.empty or 'OBS_VALUE' not in df and 'Date' not in df.columns:
+        raise ValueError('No recognizable data columns returned from the official endpoint')
+    return df
+
+def oecd_records(df, country_col='REF_AREA'):
+    for field in (country_col,'TIME_PERIOD','OBS_VALUE'):
+        if field not in df.columns:
+            raise ValueError('Missing OECD SDMX column: '+field)
+    t=df.copy()
+    t['COUNTRY_NAME']=t[country_col].map(ISO_COUNTRY)
+    t=t[t['COUNTRY_NAME'].notna()]
+    t['OBS_VALUE']=pd.to_numeric(t['OBS_VALUE'],errors='coerce')
+    t=t[t['OBS_VALUE'].notna()]
+    t=t.sort_values('TIME_PERIOD')
+    return t
+
 def normalize_country(s):
     s = re.sub(r'\s+', ' ', str(s)).strip()
-    return ALIASES.get(s, s)
+    return ISO_COUNTRY.get(s, ALIASES.get(s, s))
 
 def fetch(url):
-    r = requests.get(url.split('#')[0], headers=HEADERS, timeout=(3, 6))
+    r = requests.get(url.split('#')[0], headers=HEADERS, timeout=(5, 12))
     r.raise_for_status()
     return r.content
 
@@ -85,61 +154,100 @@ def get_bbb_spread():
                             return val/100 if '%' in raw or val >= 1 else val, 'Baa2/BBB row; spread column after rating'
     raise ValueError('Could not safely locate the Baa2/BBB spread in the ratings table.')
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
 def get_oecd_taxes():
-    tables = table_rows(fetch(OECD_URL))
-    best = {}
-    for df in tables:
-        df.columns = [' '.join(map(str,c)) if isinstance(c,tuple) else str(c) for c in df.columns]
-        cols = list(df.columns)
-        # Select latest explicit year; OECD 2024 source is historical, not necessarily current.
-        year_cols = [(int(y),c) for c in cols for y in re.findall(r'20(?:1\d|2\d)',c)]
-        if not year_cols: continue
-        year, col = max(year_cols)
-        country_col = next((c for c in cols if 'country' in c.lower() or 'jurisdiction' in c.lower() or 'economy' in c.lower()), cols[0])
-        temp = {}
-        for _,row in df.iterrows():
-            country = normalize_country(row[country_col]); value = clean_number(row[col])
-            if country in COUNTRIES and np.isfinite(value) and 0 <= value <= 60:
-                temp[country] = value/100
-        if len(temp)>len(best): best = temp; selected_year = year
-    if not best: raise ValueError('OECD table could not be parsed reliably; enter tax rates manually.')
-    return best, str(selected_year)
+    """Latest available OECD main statutory combined CIT rate, annual percent.
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_bond_yields():
-    """Try tables first, then common embedded text patterns; never fabricate yields."""
-    raw = fetch(BONDS_URL)
-    found = {}
-    try:
-        tables = table_rows(raw)
-    except (ValueError, ImportError):
-        tables = []
-    for df in tables:
-        df.columns = [' '.join(map(str,c)) if isinstance(c,tuple) else str(c) for c in df.columns]
-        cols = list(df.columns)
-        name_col = next((c for c in cols if 'country' in c.lower() or 'bond' in c.lower()), cols[0])
-        yield_col = next((c for c in cols if c.lower().strip() in ('yield','last','price')), None)
-        if yield_col is None: continue
-        for _, row in df.iterrows():
-            name = re.sub(r'\s+(?:10Y|10 Year|10-Year|Government Bond).*$', '', str(row[name_col]).strip(), flags=re.I)
-            name = normalize_country(name)
-            val = clean_number(row[yield_col])
-            if name in COUNTRIES and np.isfinite(val) and -5 < val < 50:
-                found[name] = val/100
-    if not found:
-        raise ValueError('Trading Economics did not expose a readable bond table. Editable fallback inputs will be used; they are not live quotes.')
-    return found
+    SDMX dimensions: geography.A.<other>.ST.<other>.S13/S1311/S13M.
+    Explicitly require the statutory-rate code ST and general-government coverage;
+    never use other corporate tax measures as proxies.
+    """
+    df = fetch_csv(OECD_TAX_URL)
+    for field, target in [('FREQ','A'),('MEASURE','ST')]:
+        if field in df.columns:
+            df=df[df[field].astype(str).eq(target)]
+    if 'SECTOR' in df.columns:
+        df=df[df['SECTOR'].isin(['S13','S1311','S13M'])]
+    t=oecd_records(df)
+    rates, dates={},{}
+    for name, subset in t.groupby('COUNTRY_NAME'):
+        # Prefer general government for combined statutory tax, if available.
+        if 'SECTOR' in subset.columns:
+            for sector in ['S13','S13M','S1311']:
+                cand=subset[subset['SECTOR']==sector]
+                if not cand.empty:
+                    subset=cand
+                    break
+        row=subset.iloc[-1]
+        rate=float(row['OBS_VALUE'])
+        if 0<=rate<=65:
+            rates[name]=rate/100
+            dates[name]=str(row['TIME_PERIOD'])
+    if not rates:
+        raise ValueError('OECD API returned no recognized statutory CIT observations; check API dimension layout.')
+    return rates, dates
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_fred_us_yield():
-    """Independent public fallback for US 10-year Treasury only."""
-    csv = pd.read_csv(io.BytesIO(fetch(FRED_US_URL)))
-    series = pd.to_numeric(csv['DGS10'].replace('.', np.nan), errors='coerce')
-    valid = series.dropna()
-    if valid.empty: raise ValueError('FRED DGS10 has no valid observations')
-    idx = valid.index[-1]
-    return float(valid.iloc[-1])/100, str(csv.iloc[idx,0])
+@st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
+def get_oecd_yields():
+    """OECD 10-year long-term government yield, monthly percent per annum.
+    OECD defines IRLT as 10-year government bonds. Monthly averages, not live ticks.
+    """
+    df=fetch_csv(OECD_YIELDS_URL)
+    for field, value in [('FREQ','M'),('MEASURE','IRLT'),('UNIT_MEASURE','PA')]:
+        if field in df.columns:
+            df=df[df[field].astype(str).eq(value)]
+    t=oecd_records(df)
+    rates,dates={},{}
+    for name, subset in t.groupby('COUNTRY_NAME'):
+        row=subset.iloc[-1]
+        rate=float(row['OBS_VALUE'])
+        if -10 < rate < 70:
+            rates[name]=rate/100
+            dates[name]=str(row['TIME_PERIOD'])
+    if not rates:
+        raise ValueError('OECD API returned no recognized monthly IRLT bond observations.')
+    return rates,dates
+
+@st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
+def get_treasury_us_yield():
+    """Latest U.S. 10-year nominal par Treasury yield (daily). CSV then XML."""
+    year=datetime.now(timezone.utc).year
+    failures=[]
+    for y in (year,year-1):
+        try:
+            r=fetch(TREASURY_URL.format(year=y))
+            df=pd.read_csv(io.BytesIO(r),low_memory=False)
+            date_col=next((c for c in df if str(c).strip().lower()=='date'),None)
+            yield_col=next((c for c in df if re.fullmatch(r'10\s*(?:yr|year)',str(c).strip(),re.I)),None)
+            if not date_col or not yield_col:
+                raise ValueError('Treasury CSV missing Date or 10 Yr column')
+            df['PARSED_DATE']=pd.to_datetime(df[date_col],errors='coerce')
+            df['YIELD']=pd.to_numeric(df[yield_col],errors='coerce')
+            df=df.dropna(subset=['PARSED_DATE','YIELD']).sort_values('PARSED_DATE')
+            if not df.empty:
+                row=df.iloc[-1]
+                return float(row['YIELD'])/100,str(row['PARSED_DATE'].date())
+        except Exception as exc:
+            failures.append(f'CSV {y}: {exc}')
+    # Official XML feed as alternate representation.
+    for offset in (0,1):
+        month=(datetime.now(timezone.utc).replace(day=1)-timedelta(days=offset*2)).strftime('%Y%m')
+        try:
+            root=ET.fromstring(fetch(TREASURY_XML_URL.format(yyyymm=month)))
+            candidates=[]
+            for entry in root.iter():
+                if entry.tag.split('}')[-1] != 'entry': continue
+                fields={node.tag.split('}')[-1]: (node.text or '') for node in entry.iter()}
+                date=fields.get('NEW_DATE') or fields.get('DATE')
+                val=fields.get('BC_10YEAR')
+                if date and val:
+                    candidates.append((date,float(val)))
+            if candidates:
+                date,yield_pct=max(candidates,key=lambda x:x[0])
+                return yield_pct/100,date[:10]
+        except Exception as exc:
+            failures.append(f'XML {month}: {exc}')
+    raise ValueError('U.S. Treasury CSV and XML failed: '+' | '.join(failures)[:500])
 
 def currency_convert(rate, us_yield, foreign_yield):
     return (1+rate)*(1+foreign_yield)/(1+us_yield)-1
@@ -167,43 +275,38 @@ if st.button('↻ Refresh source data', help='Clear cached web data and fetch so
     st.cache_data.clear()
     st.rerun()
 
-# Load independent sources concurrently. A blocked source must not hold the
-# entire interface hostage while other sources are waiting for HTTP timeouts.
-# Streamlit caches successful calls for 30–60 minutes; refresh clears caches.
-SOURCES = {
-    'Damodaran industry betas': (get_betas, ({}, 'Unavailable')),
-    'Damodaran BBB spread': (get_bbb_spread, (None, 'Unavailable')),
-    'OECD statutory tax rates': (get_oecd_taxes, ({}, 'Unavailable')),
-    'Trading Economics 10-year yields': (get_bond_yields, {}),
-    'FRED U.S. 10-year fallback': (get_fred_us_yield, (None, 'Unavailable')),
+# Network fetching is cached including failures so widget tweaks do not refetch.
+# Sidebar is rendered after at most one concurrent fetch window.
+SOURCE_FUNCS = {
+ 'Industry betas': (get_betas, ({}, 'Unavailable')),
+ 'USD BBB spread': (get_bbb_spread, (None, 'Unavailable')),
+ 'OECD CIT': (get_oecd_taxes, ({}, {})),
+ 'OECD monthly 10Y': (get_oecd_yields, ({}, {})),
+ 'U.S. Treasury daily 10Y': (get_treasury_us_yield, (None, 'Unavailable')),
 }
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800,show_spinner=False)
 def load_sources():
-    """Cache failures too, preventing repeated blocked requests on widget changes."""
-    errors = {}
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(SOURCES)) as pool:
-        tasks = {pool.submit(func): label for label, (func, _) in SOURCES.items()}
-        for future in as_completed(tasks):
-            label = tasks[future]
-            try:
-                results[label] = future.result()
-            except Exception as exc:
-                errors[label] = f'{type(exc).__name__}: {exc}'
-                results[label] = SOURCES[label][1]
-    return results, errors
+    result={}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures={pool.submit(resilient, label, func, fallback):label for label,(func,fallback) in SOURCE_FUNCS.items()}
+        for future in as_completed(futures):
+            result[futures[future]]=future.result()
+    return result
 
-with st.spinner('Loading market data (unavailable providers will be skipped)…'):
-    results, errors = load_sources()
-
-betas, beta_note = results['Damodaran industry betas']
-spread_data = results['Damodaran BBB spread']
-taxes, tax_year = results['OECD statutory tax rates']
-yields = results['Trading Economics 10-year yields']
-fred_yield, fred_date = results['FRED U.S. 10-year fallback']
-if 'United States' not in yields and fred_yield is not None:
-    yields['United States'] = fred_yield
-
+with st.spinner('Checking official data feeds…'):
+    loaded=load_sources()
+errors={label:entry[2] for label,entry in loaded.items() if entry[2]}
+source_status={label:entry[1] for label,entry in loaded.items()}
+betas,beta_note=loaded['Industry betas'][0]
+spread_data=loaded['USD BBB spread'][0]
+taxes,tax_dates=loaded['OECD CIT'][0]
+monthly_yields,monthly_dates=loaded['OECD monthly 10Y'][0]
+treasury_yield,treasury_date=loaded['U.S. Treasury daily 10Y'][0]
+yields=dict(monthly_yields)
+yield_dates=dict(monthly_dates)
+if treasury_yield is not None:
+    yields['United States']=treasury_yield
+    yield_dates['United States']=treasury_date
 
 with st.sidebar:
     st.header('Project settings')
@@ -218,9 +321,9 @@ with st.sidebar:
     st.caption('If a source is unavailable, editable illustrative inputs are activated automatically. They are NOT live data; verify before relying on results.')
     def override(label,auto,default=0.0,help_text=None):
         unavailable = auto is None or not np.isfinite(auto)
-        enabled = st.checkbox('Override '+label,key='enable_'+label, value=unavailable, disabled=unavailable, help='Required because automatic data are unavailable' if unavailable else None)
+        enabled = st.checkbox('Override '+label,key='enable_'+label + ('_'+tax_country if label=='Corporate tax rate (%)' else '_'+country if label=='Selected-country 10-year yield (%)' else ''), value=unavailable, disabled=unavailable, help='Required because automatic data are unavailable' if unavailable else None)
         value = st.number_input(label, value=float(auto if auto is not None and np.isfinite(auto) else default),
-                                step=0.1,format='%.3f',key='value_'+label,disabled=not enabled,help=help_text)
+                                step=0.1,format='%.3f',key='value_'+label + ('_'+tax_country if label=='Corporate tax rate (%)' else '_'+country if label=='Selected-country 10-year yield (%)' else ''),disabled=not enabled,help=help_text)
         return value,enabled
     bu_auto = betas.get(industry)
     bu_val,bu_on = override('Unlevered beta',bu_auto,1.0)
@@ -249,22 +352,28 @@ foreign_spread_override = foreign_spread_val/100 if foreign_override_on else Non
 
 st.subheader('Data sources & availability')
 source_rows = [
-    ('Unlevered industry beta','Damodaran',BETAS_URL,'Available' if betas else 'Unavailable',beta_note),
-    ('BBB borrowing spread','Damodaran',RATINGS_URL,'Available' if spread_data[0] is not None else 'Unavailable',spread_data[1]),
-    ('Corporate income tax','OECD 2024 publication',OECD_URL,'Available' if taxes else 'Unavailable',f'Latest parsed table year: {tax_year}; not a live 2026 tax feed'),
-    ('10-year sovereign yields','Trading Economics / FRED',BONDS_URL,'Available' if yields else 'Unavailable',f'US FRED DGS10 date: {fred_date} (if used); other countries may require manual inputs')]
-status_df = pd.DataFrame(source_rows,columns=['Data','Source','URL','Status','Data date / detail'])
-st.dataframe(status_df[['Data','Source','Status','Data date / detail']],hide_index=True,use_container_width=True)
-st.caption('Fetched or cache-checked at '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+' (not necessarily the publication or market observation time). Source links: '+ ' · '.join(f'[{r[1]}]({r[2]})' for r in source_rows))
-fallbacks = []
+ ('Industry beta','Damodaran',BETAS_URL,source_status['Industry betas'],beta_note),
+ ('USD BBB spread','Damodaran',RATINGS_URL,source_status['USD BBB spread'],spread_data[1]),
+ ('Corporate income tax','OECD SDMX CIT',OECD_TAX_URL,source_status['OECD CIT'],f'{tax_country}: {tax_dates.get(tax_country,"not available")}'),
+ ('US 10-year yield','U.S. Treasury',TREASURY_URL.format(year=datetime.now(timezone.utc).year),source_status['U.S. Treasury daily 10Y'],f'Daily observation: {treasury_date}'),
+ ('Other-country 10-year yields','OECD SDMX IRLT',OECD_YIELDS_URL,source_status['OECD monthly 10Y'],f'{country}: {monthly_dates.get(country,"not available")} (monthly average)')]
+status_df = pd.DataFrame(source_rows,columns=['Data','Source','URL','Retrieval','Data date / detail'])
+st.dataframe(status_df[['Data','Source','Retrieval','Data date / detail']],hide_index=True,use_container_width=True)
+st.caption('Checked at '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+'. Observation dates above are different from retrieval time. Source links: '+ ' · '.join(f'[{r[1]}]({r[2]})' for r in source_rows))
+if country != 'United States':
+    st.info('U.S. Treasury data are daily observations; foreign government yields from OECD are monthly averages. Their observation dates may not match. For same-day comparisons, override the yields with verified observations from the same date.')
+fallbacks=[]
+if bu_on and bu_auto is None: fallbacks.append('Unlevered beta')
+if spread_on and spread_auto is None: fallbacks.append('USD BBB spread')
 if tax_on and tax_auto is None: fallbacks.append('Corporate tax rate')
 if us_on and us_auto is None: fallbacks.append('U.S. 10-year yield')
 if foreign_on and foreign_auto is None and country != 'United States': fallbacks.append('Foreign 10-year yield')
 if fallbacks:
-    st.warning('Illustrative, NOT verified market inputs in use: ' + ', '.join(fallbacks) + '. Review the sidebar before interpreting the results.')
+    st.warning('Illustrative, NOT verified market inputs: '+', '.join(fallbacks)+'. Verify or edit these values before relying on results.')
 if errors:
-    with st.expander('Source warnings (expand to troubleshoot)',expanded=True):
-        for name,err in errors.items(): st.warning(f'{name}: {err}')
+    with st.expander('Source diagnostics (failed refreshes)', expanded=False):
+        for name,err in errors.items():
+            st.warning(f'{name} ({source_status[name]}): {err}')
 
 missing = [name for name,val in [('Unlevered beta',beta_u),('Corporate tax rate',tax),('USD BBB spread',spread),('U.S. 10-year yield',us_yield),('Selected-country 10-year yield',foreign_yield)] if val is None or not np.isfinite(val)]
 if missing:
@@ -298,7 +407,9 @@ with st.expander('Methodology & assumptions',expanded=True):
 
 **WACC:** $WACC=(1-w_D)K_e+w_D K_d(1-T)$. The **same selected project tax rate**, debt weight, ERP and underlying business beta are used in both currencies.
 
-**Limitations:** A 10-year government yield is a nominal sovereign-yield proxy, not necessarily a default-free rate. Sovereign credit, inflation, liquidity and term-premium differences may affect comparisons. A BBB spread may vary by maturity, issuer and currency. OECD's linked 2024 publication is historical; confirm statutory rates for the actual investment year. This model excludes incremental country-risk premiums, withholding taxes and project-specific debt adjustments.
+**Data frequency:** U.S. Treasury yields are daily; OECD IRLT yields are monthly averages. OECD statutory rates are annual. Compare dates before drawing currency conclusions.
+
+**Limitations:** A 10-year government yield is a nominal sovereign-yield proxy, not necessarily a default-free rate. Sovereign credit, inflation, liquidity and term-premium differences may affect comparisons. A BBB spread may vary by maturity, issuer and currency. OECD's official SDMX data may lag the current investment year; confirm the actual project tax treatment. This model excludes incremental country-risk premiums, withholding taxes and project-specific debt adjustments.
 ''')
 
 st.subheader('All-industry comparison')
