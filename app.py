@@ -161,11 +161,11 @@ with st.sidebar:
         st.caption(("✅ " if data[k]["error"] is None else "⚠️ ")+label)
         if data[k]["error"]: st.caption(data[k]["error"])
 
-betas=data["betas"]["value"]
+betas=data["betas"]["value"][0] if data["betas"]["value"] is not None else None
 industry_names=betas["Industry"].tolist() if betas is not None else [DEFAULT_INDUSTRY]
 industry_default=next((i for i,x in enumerate(industry_names) if x.lower()==DEFAULT_INDUSTRY.lower()),0)
-yield_data=data["yields"]["value"]
-tax_data=data["taxes"]["value"]
+yield_data=data["yields"]["value"][0] if data["yields"]["value"] is not None else None
+tax_data=data["taxes"]["value"][0] if data["taxes"]["value"] is not None else None
 countries=sorted(set((["United States"]+ (yield_data["Country"].tolist() if yield_data is not None else []) + (tax_data["Country"].tolist() if tax_data is not None else []))))
 
 def lookup(df,key,col):
