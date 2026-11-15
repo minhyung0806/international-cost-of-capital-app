@@ -12,6 +12,10 @@ BETAS_URL = 'https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls'
 RATINGS_URL = 'https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html'
 OECD_URL = 'https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html#chapter-d1e2342-08e74a33fb'
 BONDS_URL = 'https://tradingeconomics.com/bonds'
+FRED_US_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10'
+# Editable placeholders are NOT market observations. They are used only if fetching fails.
+PLACEHOLDER_TAX_PCT = 25.0
+PLACEHOLDER_YIELD_PCT = 4.0
 HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; CostOfCapitalResearch/1.0)', 'Accept-Language': 'en-US,en;q=0.9'}
 DEFAULT_INDUSTRY = 'Software (System & Application)'
 COUNTRIES = ['United States','Australia','Austria','Belgium','Brazil','Canada','Chile','China','Colombia','Czech Republic','Denmark','Finland','France','Germany','Greece','Hungary','India','Indonesia','Ireland','Israel','Italy','Japan','Malaysia','Mexico','Netherlands','New Zealand','Norway','Philippines','Poland','Portugal','Romania','Saudi Arabia','Singapore','South Africa','South Korea','Spain','Sweden','Switzerland','Thailand','Turkey','United Kingdom','Vietnam']
@@ -103,8 +107,13 @@ def get_oecd_taxes():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_bond_yields():
-    tables = table_rows(fetch(BONDS_URL))
+    """Try tables first, then common embedded text patterns; never fabricate yields."""
+    raw = fetch(BONDS_URL)
     found = {}
+    try:
+        tables = table_rows(raw)
+    except (ValueError, ImportError):
+        tables = []
     for df in tables:
         df.columns = [' '.join(map(str,c)) if isinstance(c,tuple) else str(c) for c in df.columns]
         cols = list(df.columns)
@@ -112,14 +121,24 @@ def get_bond_yields():
         yield_col = next((c for c in cols if c.lower().strip() in ('yield','last','price')), None)
         if yield_col is None: continue
         for _, row in df.iterrows():
-            name = str(row[name_col]).strip()
-            name = re.sub(r'\s+(?:10Y|10 Year|10-Year|Government Bond).*$', '', name, flags=re.I)
+            name = re.sub(r'\s+(?:10Y|10 Year|10-Year|Government Bond).*$', '', str(row[name_col]).strip(), flags=re.I)
             name = normalize_country(name)
             val = clean_number(row[yield_col])
             if name in COUNTRIES and np.isfinite(val) and -5 < val < 50:
-                found[name] = val/100  # Trading Economics bond table yields are quoted in percent.
-    if not found: raise ValueError('No reliable country 10-year yields found; Trading Economics may block scraping.')
+                found[name] = val/100
+    if not found:
+        raise ValueError('Trading Economics did not expose a readable bond table. Editable fallback inputs will be used; they are not live quotes.')
     return found
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_fred_us_yield():
+    """Independent public fallback for US 10-year Treasury only."""
+    csv = pd.read_csv(io.BytesIO(fetch(FRED_US_URL)))
+    series = pd.to_numeric(csv['DGS10'].replace('.', np.nan), errors='coerce')
+    valid = series.dropna()
+    if valid.empty: raise ValueError('FRED DGS10 has no valid observations')
+    idx = valid.index[-1]
+    return float(valid.iloc[-1])/100, str(csv.iloc[idx,0])
 
 def currency_convert(rate, us_yield, foreign_yield):
     return (1+rate)*(1+foreign_yield)/(1+us_yield)-1
@@ -158,6 +177,10 @@ betas, beta_note = load('Damodaran industry betas',get_betas,({},'Unavailable'))
 spread_data = load('Damodaran BBB spread',get_bbb_spread,(None,'Unavailable'))
 taxes, tax_year = load('OECD statutory tax rates',get_oecd_taxes,({},'Unavailable'))
 yields = load('Trading Economics 10-year yields',get_bond_yields,{})
+fred_yield, fred_date = load('FRED U.S. 10-year fallback',get_fred_us_yield,(None,'Unavailable'))
+if 'United States' not in yields and fred_yield is not None:
+    yields['United States'] = fred_yield
+
 
 with st.sidebar:
     st.header('Project settings')
@@ -169,9 +192,10 @@ with st.sidebar:
     tax_basis = st.radio('Project tax rate', ['United States','Selected country'],horizontal=True)
     st.divider()
     st.subheader('Manual overrides')
-    st.caption('Enable an override to replace an online value. No fabricated fallback data are used.')
+    st.caption('If a source is unavailable, editable illustrative inputs are activated automatically. They are NOT live data; verify before relying on results.')
     def override(label,auto,default=0.0,help_text=None):
-        enabled = st.checkbox('Override '+label,key='enable_'+label)
+        unavailable = auto is None or not np.isfinite(auto)
+        enabled = st.checkbox('Override '+label,key='enable_'+label, value=unavailable, disabled=unavailable, help='Required because automatic data are unavailable' if unavailable else None)
         value = st.number_input(label, value=float(auto if auto is not None and np.isfinite(auto) else default),
                                 step=0.1,format='%.3f',key='value_'+label,disabled=not enabled,help=help_text)
         return value,enabled
@@ -179,13 +203,13 @@ with st.sidebar:
     bu_val,bu_on = override('Unlevered beta',bu_auto,1.0)
     tax_country = 'United States' if tax_basis=='United States' else country
     tax_auto = taxes.get(tax_country)
-    tax_val,tax_on = override('Corporate tax rate (%)',tax_auto*100 if tax_auto is not None else None,25.0)
+    tax_val,tax_on = override('Corporate tax rate (%)',tax_auto*100 if tax_auto is not None else None,PLACEHOLDER_TAX_PCT)
     spread_auto = spread_data[0]
     spread_val,spread_on = override('USD BBB borrowing spread (%)',spread_auto*100 if spread_auto is not None else None,1.5)
     us_auto = yields.get('United States')
-    us_val,us_on = override('U.S. 10-year yield (%)',us_auto*100 if us_auto is not None else None,4.0)
+    us_val,us_on = override('U.S. 10-year yield (%)',us_auto*100 if us_auto is not None else None,PLACEHOLDER_YIELD_PCT)
     foreign_auto = yields.get(country)
-    foreign_val,foreign_on = override('Selected-country 10-year yield (%)',foreign_auto*100 if foreign_auto is not None else None,4.0)
+    foreign_val,foreign_on = override('Selected-country 10-year yield (%)',foreign_auto*100 if foreign_auto is not None else None,PLACEHOLDER_YIELD_PCT)
     foreign_override_on = st.checkbox('Override foreign-currency BBB spread',value=False)
     foreign_spread_val = st.number_input('Foreign BBB spread (%)',value=1.5,step=0.1,format='%.3f',disabled=not foreign_override_on)
 
@@ -196,6 +220,9 @@ us_yield = us_val/100 if us_on else us_auto
 foreign_yield = foreign_val/100 if foreign_on else foreign_auto
 if country=='United States' and not foreign_on:
     foreign_yield = us_yield  # identical country should use identical yield unless explicitly overridden
+elif country=='United States' and foreign_auto is None and foreign_on:
+    # When US is the target, the same USD 10Y yield must be used by default.
+    foreign_yield = us_yield
 foreign_spread_override = foreign_spread_val/100 if foreign_override_on else None
 
 st.subheader('Data sources & availability')
@@ -203,10 +230,16 @@ source_rows = [
     ('Unlevered industry beta','Damodaran',BETAS_URL,'Available' if betas else 'Unavailable',beta_note),
     ('BBB borrowing spread','Damodaran',RATINGS_URL,'Available' if spread_data[0] is not None else 'Unavailable',spread_data[1]),
     ('Corporate income tax','OECD 2024 publication',OECD_URL,'Available' if taxes else 'Unavailable',f'Latest parsed table year: {tax_year}; not a live 2026 tax feed'),
-    ('10-year sovereign yields','Trading Economics',BONDS_URL,'Available' if yields else 'Unavailable','Live webpage; scraping may be restricted or delayed')]
+    ('10-year sovereign yields','Trading Economics / FRED',BONDS_URL,'Available' if yields else 'Unavailable',f'US FRED DGS10 date: {fred_date} (if used); other countries may require manual inputs')]
 status_df = pd.DataFrame(source_rows,columns=['Data','Source','URL','Status','Data date / detail'])
 st.dataframe(status_df[['Data','Source','Status','Data date / detail']],hide_index=True,use_container_width=True)
 st.caption('Fetched or cache-checked at '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+' (not necessarily the publication or market observation time). Source links: '+ ' · '.join(f'[{r[1]}]({r[2]})' for r in source_rows))
+fallbacks = []
+if tax_on and tax_auto is None: fallbacks.append('Corporate tax rate')
+if us_on and us_auto is None: fallbacks.append('U.S. 10-year yield')
+if foreign_on and foreign_auto is None and country != 'United States': fallbacks.append('Foreign 10-year yield')
+if fallbacks:
+    st.warning('Illustrative, NOT verified market inputs in use: ' + ', '.join(fallbacks) + '. Review the sidebar before interpreting the results.')
 if errors:
     with st.expander('Source warnings (expand to troubleshoot)',expanded=True):
         for name,err in errors.items(): st.warning(f'{name}: {err}')
@@ -268,7 +301,7 @@ result_df=pd.DataFrame([{'Industry':industry,'Country':country,'Tax basis':tax_c
     'USD cost of equity (%)':res['ke_us']*100,'Foreign cost of equity (%)':res['ke_foreign']*100,
     'USD cost of debt (%)':res['kd_us']*100,'Foreign cost of debt (%)':res['kd_foreign']*100,
     'USD WACC (%)':res['wacc_us']*100,'Foreign WACC (%)':res['wacc_foreign']*100,
-    'Calculated UTC':datetime.now(timezone.utc).isoformat()}])
+    'Illustrative fallback inputs':'; '.join(fallbacks),'Calculated UTC':datetime.now(timezone.utc).isoformat()}])
 st.download_button('Download selected-project results (CSV)',result_df.to_csv(index=False).encode('utf-8-sig'),'international_cost_of_capital_project.csv','text/csv')
 
 with st.expander('Model validation checks'):
