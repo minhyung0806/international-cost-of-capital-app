@@ -16,7 +16,10 @@ import streamlit as st
 
 BETAS_URL = 'https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls'
 RATINGS_URL = 'https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html'
-OECD_TAX_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A.CIT_C.ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile'
+OECD_TAX_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile'
+OECD_TAX_NARROW_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A.CIT_C.ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile'
+OECD_DERIVED_SNAPSHOT_URL = 'https://goldsteinco.net/corporate-tax-rates-by-country-2026/corporate-tax-rates-2026.csv'
+OECD_DERIVED_SNAPSHOT_PAGE = 'https://goldsteinco.net/corporate-tax-rates-by-country-2026/'
 OECD_YIELDS_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/.M.IRLT.PA.....?startPeriod=2025-01&format=csvfile'
 TREASURY_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve&page&_format=csv'
 TREASURY_XML_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={yyyymm}'
@@ -154,36 +157,138 @@ def get_bbb_spread():
                             return val/100 if '%' in raw or val >= 1 else val, 'Baa2/BBB row; spread column after rating'
     raise ValueError('Could not safely locate the Baa2/BBB spread in the ratings table.')
 
-@st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
-def get_oecd_taxes():
-    """Latest available combined statutory corporate income tax rates.
+def _oecd_tax_parse(df):
+    """Read SDMX flat CSV by *codes*, never by translated text labels.
 
-    OECD SDMX key: REF_AREA.FREQ.MEASURE.TARGETING.<dimension>.SECTOR...
-    CIT_C is the combined corporate rate; ST is statutory targeting;
-    S13 is general government. Never silently substitute another measure.
+    Assert OECD combined statutory / general government, and retain date per country.
     """
-    df = fetch_csv(OECD_TAX_URL)
-    required = {'REF_AREA', 'TIME_PERIOD', 'OBS_VALUE', 'MEASURE', 'TARGETING', 'SECTOR'}
-    missing = sorted(required - set(df.columns))
+    df = df.copy()
+    df.columns = [str(c).strip().lstrip('\ufeff').upper() for c in df.columns]
+    required = ('REF_AREA', 'TIME_PERIOD', 'OBS_VALUE', 'MEASURE', 'TARGETING', 'SECTOR')
+    missing = [col for col in required if col not in df.columns]
     if missing:
-        raise ValueError(f'OECD CIT CSV missing expected columns {missing}. Received: {list(df.columns)}')
-    df = df.loc[(df['MEASURE'].astype(str) == 'CIT_C') &
-                (df['TARGETING'].astype(str) == 'ST') &
-                (df['SECTOR'].astype(str) == 'S13')]
+        raise ValueError(f'CSV columns missing {missing}; received columns={list(df.columns)[:28]}')
+    # Data Explorer explicitly describes the selected series as CIT_C, ST, S13.
+    for col, expected in [('MEASURE','CIT_C'), ('TARGETING','ST'), ('SECTOR','S13')]:
+        values = df[col].astype(str).str.strip().str.upper()
+        df = df.loc[values.eq(expected)]
     if 'FREQ' in df.columns:
-        df = df.loc[df['FREQ'].astype(str) == 'A']
+        df = df.loc[df['FREQ'].astype(str).str.strip().str.upper().eq('A')]
     t = oecd_records(df)
     rates, dates = {}, {}
     for name, subset in t.groupby('COUNTRY_NAME'):
         row = subset.iloc[-1]
-        rate = float(row['OBS_VALUE'])
-        if 0 <= rate <= 65:
-            rates[name] = rate / 100
+        val = float(row['OBS_VALUE'])
+        if 0 <= val <= 65:
+            rates[name] = val/100
             dates[name] = str(row['TIME_PERIOD'])
-    if not rates:
-        raise ValueError('OECD returned no recognized combined statutory CIT rates (CIT_C, ST, S13). '
-                         'Verify CSV dimension labels and REF_AREA codes.')
     return rates, dates
+
+def _tax_csv_diagnostics(df):
+    cols=[str(x).strip().upper() for x in df.columns]
+    details=[f'rows={len(df)}', f'columns={cols[:22]}']
+    for col in ('MEASURE','TARGETING','SECTOR','FREQ','REF_AREA'):
+        names={str(c).strip().upper():c for c in df.columns}
+        if col in names:
+            actual=names[col]
+            values=df[actual].dropna().astype(str).str.strip().value_counts().head(7).index.tolist()
+            details.append(f'{col} examples={values}')
+    return '; '.join(details)[:1100]
+
+SNAPSHOT_COUNTRY_ALIASES = {
+    'Korea':'South Korea', 'China (People’s Republic of)':'China',
+    'China (People\'s Republic of)':'China', 'Czechia':'Czech Republic',
+    'Türkiye':'Turkey', 'Turkiye':'Turkey'
+}
+
+def _snapshot_tax_parse(raw):
+    """A publicly published OECD-derived October 2026 extract, NOT a live OECD quote.
+
+    Validate required countries against the publication's stated numbers.
+    """
+    data=pd.read_csv(io.BytesIO(raw))
+    # Column names may evolve: inspect rather than assume a fixed position.
+    norm={str(c).strip().lower().replace('_',' ').replace('  ',' '):c for c in data.columns}
+    country_col=next((c for k,c in norm.items() if k in ('jurisdiction','country','name','reference area')),None)
+    year_cols={year:next((c for k,c in norm.items() if str(year) in k and 'combined' in k),None) for year in (2026,2025,2024)}
+    # In this publisher's export year columns may just be '2026', '2025'.
+    for year in year_cols:
+        if year_cols[year] is None:
+            year_cols[year]=next((c for k,c in norm.items() if k==str(year)),None)
+    if country_col is None or not any(year_cols.values()):
+        raise ValueError(f'OECD-derived snapshot CSV schema not recognized: {list(data.columns)[:20]}')
+    rates,dates={},{}
+    for _,r in data.iterrows():
+        raw_country=str(r[country_col]).strip()
+        country=SNAPSHOT_COUNTRY_ALIASES.get(raw_country,normalize_country(raw_country))
+        if country not in COUNTRIES: continue
+        for year in (2026,2025,2024):
+            col=year_cols[year]
+            if col is None: continue
+            rate=clean_number(r[col])
+            if np.isfinite(rate) and 0 <= rate <= 65:
+                rates[country]=rate/100
+                dates[country]=f'{year} (OECD-derived snapshot, retrieved by publisher 2026-10-22)'
+                break
+    # Cross-check 2026 publication headline; reject unexpected schemas.
+    usa=rates.get('United States')
+    if usa is None or not (0.250 <= usa <= 0.260):
+        raise ValueError('Snapshot failed U.S. 2026 combined-rate sanity check; columns '+str(list(data.columns)[:14]))
+    if len(rates)<10:
+        raise ValueError(f'Snapshot parsed only {len(rates)} countries; refusing potentially misleading results')
+    return rates, dates
+
+# Last-resort published snapshot, manually transcribed from a 2026-10-22
+# OECD-derived table by Goldstein & Co; NOT a live OECD API observation.
+PUBLISHED_TAX_BACKSTOP = {
+ 'United States':(25.53,2026),'Australia':(30,2026),'Austria':(23,2026),
+ 'Belgium':(25,2026),'Brazil':(34,2026),'Canada':(26,2026),
+ 'Chile':(27,2026),'China':(25,2026),'Colombia':(35,2025),
+ 'Czech Republic':(21,2026),'Denmark':(22,2026),'Finland':(20,2026),
+ 'France':(36.13,2026),'Germany':(30.13,2026),'Greece':(22,2026),
+ 'Hungary':(9,2026),'India':(25.17,2026),'Indonesia':(22,2026),
+ 'Ireland':(12.5,2026),'Israel':(23,2025),'Italy':(27.81,2026),
+ 'Japan':(29.74,2026),'Malaysia':(24,2026),'Mexico':(30,2026),
+ 'Netherlands':(25.8,2026),'New Zealand':(28,2026),'Norway':(22,2026),
+ 'Philippines':(25,2026),'Poland':(19,2026),'Portugal':(29.5,2026),
+ 'Romania':(16,2026),'Saudi Arabia':(20,2026),'Singapore':(17,2026),
+ 'South Africa':(27,2026),'South Korea':(27.5,2026),'Spain':(25,2026),
+ 'Sweden':(20.6,2026),'Switzerland':(19.47,2026),'Thailand':(20,2026),
+ 'Turkey':(25,2025),'United Kingdom':(25,2026),'Vietnam':(20,2026),
+}
+
+def _published_tax_backstop():
+    rates={c:value/100 for c,(value,year) in PUBLISHED_TAX_BACKSTOP.items()}
+    dates={c:f'{year} (published OECD-derived extract, 2026-10-22)' for c,(value,year) in PUBLISHED_TAX_BACKSTOP.items()}
+    return rates,dates
+
+@st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
+def get_oecd_taxes():
+    """Try official OECD SDMX dataset, then a clearly dated independent OECD extract.
+
+    Returns (rates, date per country, provenance), never an unlabelled guess.
+    """
+    failures=[]
+    for url in (OECD_TAX_URL, OECD_TAX_NARROW_URL):
+        try:
+            df=fetch_csv(url)
+            rates,dates=_oecd_tax_parse(df)
+            if len(rates) >= 10 and 'United States' in rates:
+                return rates,dates,'OECD SDMX official API'
+            failures.append('Official query returned insufficient matching observations: '+_tax_csv_diagnostics(df))
+        except Exception as exc:
+            failures.append(f'Official SDMX request failed: {str(exc)[:350]}')
+    try:
+        rates, dates = _snapshot_tax_parse(fetch(OECD_DERIVED_SNAPSHOT_URL))
+        return rates, dates, ('OECD-derived third-party published extract (retrieved by publisher 2026-10-22); '
+                              'official feed failed: '+ ' | '.join(failures)[:600])
+    except Exception as exc:
+        rates,dates=_published_tax_backstop()
+        provenance=('Bundled dated OECD-derived published table (NOT live OECD), '
+                    'publisher retrieved the data 2026-10-22. '
+                    'Official/snapshot fetch issues: '
+                    + ' | '.join(failures)[:350] + ' | '+str(exc)[:250])
+        return rates,dates,provenance
 
 @st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
 def get_oecd_yields():
@@ -278,7 +383,7 @@ if st.button('↻ Refresh source data', help='Clear cached web data and fetch so
 SOURCE_FUNCS = {
  'Industry betas': (get_betas, ({}, 'Unavailable')),
  'USD BBB spread': (get_bbb_spread, (None, 'Unavailable')),
- 'OECD CIT': (get_oecd_taxes, ({}, {})),
+ 'OECD CIT': (get_oecd_taxes, ({}, {}, 'Unavailable')),
  'OECD monthly 10Y': (get_oecd_yields, ({}, {})),
  'U.S. Treasury daily 10Y': (get_treasury_us_yield, (None, 'Unavailable')),
 }
@@ -297,7 +402,7 @@ errors={label:entry[2] for label,entry in loaded.items() if entry[2]}
 source_status={label:entry[1] for label,entry in loaded.items()}
 betas,beta_note=loaded['Industry betas'][0]
 spread_data=loaded['USD BBB spread'][0]
-taxes,tax_dates=loaded['OECD CIT'][0]
+taxes,tax_dates,tax_provenance=loaded['OECD CIT'][0]
 monthly_yields,monthly_dates=loaded['OECD monthly 10Y'][0]
 treasury_yield,treasury_date=loaded['U.S. Treasury daily 10Y'][0]
 yields=dict(monthly_yields)
@@ -352,11 +457,13 @@ st.subheader('Data sources & availability')
 source_rows = [
  ('Industry beta','Damodaran',BETAS_URL,source_status['Industry betas'],beta_note),
  ('USD BBB spread','Damodaran',RATINGS_URL,source_status['USD BBB spread'],spread_data[1]),
- ('Corporate income tax','OECD SDMX CIT',OECD_TAX_URL,source_status['OECD CIT'],f'{tax_country}: {tax_dates.get(tax_country,"not available")}'),
+ ('Corporate income tax','OECD SDMX / dated third-party extract',OECD_TAX_URL,source_status['OECD CIT'],f'{tax_country}: {tax_dates.get(tax_country,"not available")}'),
  ('US 10-year yield','U.S. Treasury',TREASURY_URL.format(year=datetime.now(timezone.utc).year),source_status['U.S. Treasury daily 10Y'],f'Daily observation: {treasury_date}'),
  ('Other-country 10-year yields','OECD SDMX IRLT',OECD_YIELDS_URL,source_status['OECD monthly 10Y'],f'{country}: {monthly_dates.get(country,"not available")} (monthly average)')]
 status_df = pd.DataFrame(source_rows,columns=['Data','Source','URL','Retrieval','Data date / detail'])
 st.dataframe(status_df[['Data','Source','Retrieval','Data date / detail']],hide_index=True,use_container_width=True)
+if tax_provenance != 'OECD SDMX official API':
+    st.info('Corporate tax source: '+tax_provenance+' — [publisher snapshot]('+OECD_DERIVED_SNAPSHOT_PAGE+'). A dated third-party snapshot is not a live OECD quote.')
 st.caption('Checked at '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+'. Observation dates above are different from retrieval time. Source links: '+ ' · '.join(f'[{r[1]}]({r[2]})' for r in source_rows))
 if country != 'United States':
     st.info('U.S. Treasury data are daily observations; foreign government yields from OECD are monthly averages. Their observation dates may not match. For same-day comparisons, override the yields with verified observations from the same date.')
