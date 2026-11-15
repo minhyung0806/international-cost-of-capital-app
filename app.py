@@ -16,7 +16,7 @@ import streamlit as st
 
 BETAS_URL = 'https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls'
 RATINGS_URL = 'https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html'
-OECD_TAX_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13+S1311+S13M...?startPeriod=2023&format=csvfile'
+OECD_TAX_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A.CIT_C.ST..S13...?startPeriod=2023&dimensionAtObservation=AllDimensions&format=csvfile'
 OECD_YIELDS_URL = 'https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/.M.IRLT.PA.....?startPeriod=2025-01&format=csvfile'
 TREASURY_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve&page&_format=csv'
 TREASURY_XML_URL = 'https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={yyyymm}'
@@ -156,35 +156,33 @@ def get_bbb_spread():
 
 @st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
 def get_oecd_taxes():
-    """Latest available OECD main statutory combined CIT rate, annual percent.
+    """Latest available combined statutory corporate income tax rates.
 
-    SDMX dimensions: geography.A.<other>.ST.<other>.S13/S1311/S13M.
-    Explicitly require the statutory-rate code ST and general-government coverage;
-    never use other corporate tax measures as proxies.
+    OECD SDMX key: REF_AREA.FREQ.MEASURE.TARGETING.<dimension>.SECTOR...
+    CIT_C is the combined corporate rate; ST is statutory targeting;
+    S13 is general government. Never silently substitute another measure.
     """
     df = fetch_csv(OECD_TAX_URL)
-    for field, target in [('FREQ','A'),('MEASURE','ST')]:
-        if field in df.columns:
-            df=df[df[field].astype(str).eq(target)]
-    if 'SECTOR' in df.columns:
-        df=df[df['SECTOR'].isin(['S13','S1311','S13M'])]
-    t=oecd_records(df)
-    rates, dates={},{}
+    required = {'REF_AREA', 'TIME_PERIOD', 'OBS_VALUE', 'MEASURE', 'TARGETING', 'SECTOR'}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f'OECD CIT CSV missing expected columns {missing}. Received: {list(df.columns)}')
+    df = df.loc[(df['MEASURE'].astype(str) == 'CIT_C') &
+                (df['TARGETING'].astype(str) == 'ST') &
+                (df['SECTOR'].astype(str) == 'S13')]
+    if 'FREQ' in df.columns:
+        df = df.loc[df['FREQ'].astype(str) == 'A']
+    t = oecd_records(df)
+    rates, dates = {}, {}
     for name, subset in t.groupby('COUNTRY_NAME'):
-        # Prefer general government for combined statutory tax, if available.
-        if 'SECTOR' in subset.columns:
-            for sector in ['S13','S13M','S1311']:
-                cand=subset[subset['SECTOR']==sector]
-                if not cand.empty:
-                    subset=cand
-                    break
-        row=subset.iloc[-1]
-        rate=float(row['OBS_VALUE'])
-        if 0<=rate<=65:
-            rates[name]=rate/100
-            dates[name]=str(row['TIME_PERIOD'])
+        row = subset.iloc[-1]
+        rate = float(row['OBS_VALUE'])
+        if 0 <= rate <= 65:
+            rates[name] = rate / 100
+            dates[name] = str(row['TIME_PERIOD'])
     if not rates:
-        raise ValueError('OECD API returned no recognized statutory CIT observations; check API dimension layout.')
+        raise ValueError('OECD returned no recognized combined statutory CIT rates (CIT_C, ST, S13). '
+                         'Verify CSV dimension labels and REF_AREA codes.')
     return rates, dates
 
 @st.cache_data(ttl=SOURCE_TTL, show_spinner=False)
